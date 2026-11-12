@@ -1,24 +1,32 @@
 --[[
-    SaveMap | FayintX (versi dirapikan)
-    - Hapus hook getfenv/setfenv yang berisiko merusak script lain
-    - Perbaikan layout, progress, drag, nama file, tombol close
+    SaveMap | FayintX (versi diperbaiki)
+    Perbaikan utama:
+    - Hapus goto/label (tidak didukung Luau -> penyebab GUI tidak muncul)
+    - Parent GUI aman: gethui -> CoreGui -> PlayerGui + protect_gui
+    - HttpGet/loadstring dibungkus pcall, ada fallback request/http_request
+    - Cancel tidak lagi bisa diklik setelah selesai & tidak bisa Start ganda
+    - Koneksi drag dilepas saat GUI ditutup
+    - Panel guide responsif (scroll) dan ikut hancur saat GUI ditutup
+    - Guard error di seluruh bagian pembuatan GUI
 ]]
 
 ----------------------------------------------------------------
 -- Services
 ----------------------------------------------------------------
-local CoreGui          = game:GetService("CoreGui")
-local StarterGui       = game:GetService("StarterGui")
-local UserInputService = game:GetService("UserInputService")
-local TweenService     = game:GetService("TweenService")
-local Lighting         = game:GetService("Lighting")
+local Players           = game:GetService("Players")
+local CoreGui           = game:GetService("CoreGui")
+local StarterGui        = game:GetService("StarterGui")
+local UserInputService  = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
+local Lighting          = game:GetService("Lighting")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Workspace        = game:GetService("Workspace")
+local Workspace         = game:GetService("Workspace")
 
 ----------------------------------------------------------------
 -- Konfigurasi
 ----------------------------------------------------------------
 local GUI_NAME = "FayintXCopy"
+local GUIDE_NAME = "SaveMapGuide"
 local SAVE_MODULE_URL =
     "https://raw.githubusercontent.com/FayintXhub/FayintLibrary/refs/heads/main/FYSavemap.luau"
 
@@ -40,53 +48,59 @@ local C = {
 }
 
 ----------------------------------------------------------------
--- Deteksi executor + warna aksen
+-- Deteksi executor + warna aksen (tanpa goto)
 ----------------------------------------------------------------
 local function detectExecutor()
     local ok, name = pcall(function()
         if identifyexecutor then return (identifyexecutor()) end
         if getexecutorname then return (getexecutorname()) end
         if executor then return executor end
+        return nil
     end)
-    return (ok and type(name) == "string" and name ~= "") and name or "Unknown"
+    if ok and type(name) == "string" and name ~= "" then
+        return name
+    end
+    return "Unknown"
 end
 
 local EXECUTOR_COLORS = {
-    { { "flux" },                       "#30ff6a" },
-    { { "delta" },                      "#e74c3c" },
-    { { "arceus" },                     "#a03cff" },
-    { { "krampus", "oxygen" },          "#ff3838" },
-    { { "volcano" },                    "#ff8c00" },
-    { { "synapse", "script", "krypton" }, "#ffd700" },
-    { { "wave" },                       "#00e5ff" },
-    { { "zenith" },                     "#ff00ff" },
-    { { "seliware" },                   "#00ffa2" },
-    { { "krnl" },                       "#1e90ff" },
-    { { "trigon" },                     "#ff007f" },
-    { { "nihon" },                      "#8a2be2" },
-    { { "celery" },                     "#4caf50" },
-    { { "lunar" },                      "#8080ff" },
-    { { "valyse" },                     "#ff1493" },
-    { { "vega" },                       "#4682b4" },
-    { { "electron" },                   "#7fffd4" },
-    { { "awp" },                        "#ff005e" },
-    { { "bunni" },                      "#ff69b4" },
+    { { "real" },                          "#00c8ff" },
+    { { "flux" },                          "#30ff6a" },
+    { { "delta" },                         "#e74c3c" },
+    { { "arceus" },                        "#a03cff" },
+    { { "krampus", "oxygen" },             "#ff3838" },
+    { { "volcano" },                       "#ff8c00" },
+    { { "synapse", "scriptware", "script-ware", "krypton" }, "#ffd700" },
+    { { "wave" },                          "#00e5ff" },
+    { { "zenith" },                        "#ff00ff" },
+    { { "seliware" },                      "#00ffa2" },
+    { { "krnl" },                          "#1e90ff" },
+    { { "trigon" },                        "#ff007f" },
+    { { "nihon" },                         "#8a2be2" },
+    { { "celery" },                        "#4caf50" },
+    { { "lunar" },                         "#8080ff" },
+    { { "valyse" },                        "#ff1493" },
+    { { "vega" },                          "#4682b4" },
+    { { "electron" },                      "#7fffd4" },
+    { { "awp" },                           "#ff005e" },
+    { { "bunni" },                         "#ff69b4" },
 }
 
-local executorName = detectExecutor()
-local accent = Color3.fromRGB(200, 200, 200)
-do
-    local lowered = executorName:lower()
+local function pickAccent(name)
+    local lowered = string.lower(name)
     for _, entry in ipairs(EXECUTOR_COLORS) do
         for _, keyword in ipairs(entry[1]) do
-            if lowered:find(keyword, 1, true) then
-                accent = Color3.fromHex(entry[2])
-                goto found
+            if string.find(lowered, keyword, 1, true) then
+                local ok, color = pcall(Color3.fromHex, entry[2])
+                if ok then return color end
             end
         end
     end
-    ::found::
+    return Color3.fromRGB(200, 200, 200)
 end
+
+local executorName = detectExecutor()
+local accent = pickAccent(executorName)
 
 ----------------------------------------------------------------
 -- Helper UI
@@ -135,18 +149,21 @@ local function isPointerMove(input)
         or input.UserInputType == Enum.UserInputType.Touch
 end
 
-local function makeDraggable(frame, handle)
-    local dragging, dragStart, startPos
+-- Semua koneksi global dikumpulkan agar bisa dilepas saat GUI ditutup
+local connections = {}
 
-    handle.InputBegan:Connect(function(input)
+local function makeDraggable(frame, handle)
+    local dragging, dragStart, startPos = false, nil, nil
+
+    table.insert(connections, handle.InputBegan:Connect(function(input)
         if isPointerStart(input) then
             dragging = true
             dragStart = input.Position
             startPos = frame.Position
         end
-    end)
+    end))
 
-    UserInputService.InputChanged:Connect(function(input)
+    table.insert(connections, UserInputService.InputChanged:Connect(function(input)
         if dragging and isPointerMove(input) then
             local delta = input.Position - dragStart
             frame.Position = UDim2.new(
@@ -154,30 +171,59 @@ local function makeDraggable(frame, handle)
                 startPos.Y.Scale, startPos.Y.Offset + delta.Y
             )
         end
-    end)
+    end))
 
-    UserInputService.InputEnded:Connect(function(input)
+    table.insert(connections, UserInputService.InputEnded:Connect(function(input)
         if isPointerStart(input) then
             dragging = false
+        end
+    end))
+end
+
+----------------------------------------------------------------
+-- Parent GUI yang aman
+----------------------------------------------------------------
+local function getGuiParent()
+    if gethui then
+        local ok, ui = pcall(gethui)
+        if ok and typeof(ui) == "Instance" then return ui end
+    end
+    local ok = pcall(function() return CoreGui.Name end)
+    if ok then return CoreGui end
+    local lp = Players.LocalPlayer or Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+    return Players.LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local guiParent = getGuiParent()
+
+local function protect(gui)
+    pcall(function()
+        if syn and syn.protect_gui then
+            syn.protect_gui(gui)
+        elseif protect_gui then
+            protect_gui(gui)
         end
     end)
 end
 
-----------------------------------------------------------------
--- Bersihkan GUI lama, lalu buat ScreenGui baru
-----------------------------------------------------------------
-local guiParent = (gethui and gethui()) or CoreGui
-
+-- Bersihkan GUI lama
 for _, parent in ipairs({ CoreGui, guiParent }) do
-    local old = parent:FindFirstChild(GUI_NAME)
-    if old then old:Destroy() end
+    pcall(function()
+        for _, name in ipairs({ GUI_NAME, GUIDE_NAME }) do
+            local old = parent:FindFirstChild(name)
+            if old then old:Destroy() end
+        end
+    end)
 end
 
 local screenGui = new("ScreenGui", {
     Name = GUI_NAME,
     ResetOnSpawn = false,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-}, guiParent)
+    DisplayOrder = 999,
+})
+protect(screenGui)
+screenGui.Parent = guiParent
 
 ----------------------------------------------------------------
 -- Frame utama
@@ -322,7 +368,6 @@ local settingsPage = new("Frame", {
 ----------------------------------------------------------------
 local mode = "optimized"
 
--- Mode
 local modeContainer = new("Frame", {
     BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0.12, 0),
 }, savePage)
@@ -426,7 +471,7 @@ local detailLabel = new("TextLabel", {
     TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
 }, savePage)
 
--- Tombol aksi (sebelumnya menimpa kontrol lain karena Position 0,0)
+-- Tombol aksi
 local actionButtons = new("Frame", {
     BackgroundTransparency = 1, Position = UDim2.new(0, 0, 0.56, 0), Size = UDim2.new(1, 0, 0.4, 0),
 }, savePage)
@@ -520,8 +565,10 @@ settingsTab.MouseButton1Click:Connect(function() showTab("Settings") end)
 -- State & progress
 ----------------------------------------------------------------
 local state = {
-    running = false,
+    running = false,   -- sesi save aktif (tombol cancel tampil)
+    busy = false,      -- modul save masih berjalan di belakang layar
     cancelled = false,
+    done = false,
     runId = 0,
     total = 0,
     processed = 0,
@@ -531,7 +578,7 @@ local state = {
 local function setProgress(percent, phase, detail)
     if not progressContainer.Parent then return end
 
-    percent = math.clamp(percent, 0, 100)
+    percent = math.floor(math.clamp(percent, 0, 100))
     local countText = state.total > 0
         and string.format(" (%d/%d)", state.processed, state.total) or ""
     progressText.Text = string.format("%d%%%s", percent, countText)
@@ -567,24 +614,42 @@ end
 local function countInstances()
     local total = 0
     for _, service in ipairs({ Workspace, Lighting, ReplicatedStorage }) do
-        total = total + 1 + #service:GetDescendants()
+        local ok, n = pcall(function() return #service:GetDescendants() end)
+        total = total + 1 + (ok and n or 0)
     end
     return total
 end
 
-local function loadSaveModule()
-    if not (game.HttpGet and loadstring) then
-        error("Executor tidak mendukung HttpGet/loadstring")
+local function httpGet(url)
+    -- Coba game:HttpGet dulu, lalu fallback ke request/http_request
+    local ok, res = pcall(function() return game:HttpGet(url, true) end)
+    if ok and type(res) == "string" and res ~= "" then return res end
+
+    local req = (syn and syn.request) or http_request or request
+        or (http and http.request) or (fluxus and fluxus.request)
+    if req then
+        local ok2, r = pcall(req, { Url = url, Method = "GET" })
+        if ok2 and r and (r.StatusCode == 200 or r.Success) and r.Body then
+            return r.Body
+        end
     end
-    local source = game:HttpGet(SAVE_MODULE_URL, true)
-    local fn, err = loadstring(source, "FYSavemap")
+    error("HttpGet gagal: " .. tostring(res))
+end
+
+local function loadSaveModule()
+    local compile = loadstring or load
+    if not compile then
+        error("Executor tidak mendukung loadstring")
+    end
+    local source = httpGet(SAVE_MODULE_URL)
+    local fn, err = compile(source, "FYSavemap")
     if not fn then
         error("Gagal compile modul: " .. tostring(err))
     end
     return fn()
 end
 
-local function buildOptions(fileName, onFinished)
+local function buildOptions(fileName, runId, onFinished)
     return {
         mode = mode,
         noscripts = settings.noscripts.state,
@@ -602,28 +667,41 @@ local function buildOptions(fileName, onFinished)
         ReadMe = true,
         AntiIdle = true,
         Callback = function(data, _, size)
-            if state.cancelled then return end
             onFinished()
+            if state.cancelled or state.runId ~= runId then return end
 
             setProgress(95, "Writing", "Finalizing file write...")
+
+            -- Tulis manual hanya jika modul belum membuat file sendiri
             if writefile then
                 local path = fileName:match("%.rbxlx?$") and fileName or (fileName .. ".rbxlx")
-                writefile(path, data)
+                local exists = isfile and isfile(path)
+                if not exists and data then
+                    pcall(writefile, path, data)
+                end
             end
 
-            local mb = (type(size) == "number" and size or #tostring(data)) / 1048576
-            setProgress(100, "Completed", string.format("File saved successfully (%.2f MB)", mb))
+            local bytes = (type(size) == "number" and size) or #tostring(data)
+            setProgress(100, "Completed",
+                string.format("File saved successfully (%.2f MB)", bytes / 1048576))
         end,
     }
 end
 
 local function startSave()
     if state.running then return end
+    if state.busy then
+        notify("Please wait", "Previous save is still finishing in the background")
+        return
+    end
 
     state.running = true
+    state.busy = true
     state.cancelled = false
+    state.done = false
     state.runId = state.runId + 1
     state.processed = 0
+    state.total = 0
     state.startTime = os.clock()
     local runId = state.runId
 
@@ -633,6 +711,7 @@ local function startSave()
     guideButton.Visible = false
 
     local fileName = filenameBox.Text ~= "" and filenameBox.Text or "FayintSavedMap"
+    fileName = fileName:gsub('[\\/:*?"<>|]', "_") -- buang karakter ilegal nama file
 
     task.spawn(function()
         local ok, err = pcall(function()
@@ -651,10 +730,9 @@ local function startSave()
 
             setProgress(15, "Configuring", "Building save options...")
             local finished = false
-            local options = buildOptions(fileName, function() finished = true end)
+            local options = buildOptions(fileName, runId, function() finished = true end)
 
-            -- Progress simulasi (estimasi): dijalankan SEBELUM proses save dimulai,
-            -- bukan di dalam Callback seperti di versi lama.
+            -- Progress estimasi (bukan progres asli dari modul)
             task.spawn(function()
                 for p = 20, 90 do
                     if finished or state.cancelled or state.runId ~= runId then break end
@@ -674,8 +752,10 @@ local function startSave()
             saveMap(options)
             finished = true
 
-            if state.cancelled then return end
+            if state.cancelled or state.runId ~= runId then return end
 
+            state.done = true
+            cancelButton.Visible = false
             state.processed = state.total
             setProgress(100, "Completed",
                 string.format("Saved %d instances successfully!", state.total))
@@ -687,18 +767,21 @@ local function startSave()
             print(string.format("[SaveMap] File saved: %s.rbxlx", fileName))
         end)
 
-        if not ok then
+        state.busy = false
+
+        if not ok and not state.cancelled and state.runId == runId then
             setProgress(0, "Error", "Save failed - Check console (F9)")
             startButton.Text = "❌ FAILED"
             startButton.BackgroundColor3 = C.red
+            cancelButton.Visible = false
             notify("❌ Save Failed", "Check console for details (F9)", "rbxassetid://6023426919")
             warn("[SaveMap] Error:", err)
         end
 
+        if state.runId ~= runId or state.cancelled then return end
         task.wait(3)
 
-        -- Hanya reset jika tidak dibatalkan / tidak ada sesi baru
-        if state.runId == runId and not state.cancelled then
+        if state.runId == runId and not state.cancelled and screenGui.Parent then
             resetButtons()
             state.running = false
         end
@@ -706,7 +789,7 @@ local function startSave()
 end
 
 local function cancelSave()
-    if not state.running then return end
+    if not state.running or state.done then return end
 
     state.cancelled = true
     state.running = false
@@ -741,15 +824,22 @@ local GUIDE_LINES = {
     "   • Try different save mode",
 }
 
-local guideOpen = false
+local guideGui = nil
 
 guideButton.MouseButton1Click:Connect(function()
-    if guideOpen then return end
-    guideOpen = true
+    if guideGui then return end
 
-    local guideGui = new("ScreenGui", {
-        Name = "SaveMapGuide", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-    }, guiParent)
+    guideGui = new("ScreenGui", {
+        Name = GUIDE_NAME, ResetOnSpawn = false,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 1000,
+    })
+    protect(guideGui)
+    guideGui.Parent = guiParent
+
+    local cam = Workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+    local width = math.min(450, vp.X - 20)
+    local height = math.min(400, vp.Y - 20)
 
     local panel = new("Frame", {
         BackgroundColor3 = Color3.fromRGB(15, 8, 12), BorderSizePixel = 0,
@@ -765,9 +855,11 @@ guideButton.MouseButton1Click:Connect(function()
         TextColor3 = Color3.fromRGB(255, 200, 200), TextSize = 18, ZIndex = 3,
     }, panel)
 
-    local list = new("Frame", {
-        BackgroundTransparency = 1, Position = UDim2.new(0, 40, 0, 50), Size = UDim2.new(1, -80, 0, 320),
-        ZIndex = 3,
+    local list = new("ScrollingFrame", {
+        BackgroundTransparency = 1, BorderSizePixel = 0,
+        Position = UDim2.new(0, 30, 0, 50), Size = UDim2.new(1, -60, 1, -100),
+        CanvasSize = UDim2.new(0, 0, 0, #GUIDE_LINES * 18),
+        ScrollBarThickness = 4, ZIndex = 3,
     }, panel)
 
     for index, line in ipairs(GUIDE_LINES) do
@@ -804,22 +896,38 @@ guideButton.MouseButton1Click:Connect(function()
     closeGuide.MouseButton1Click:Connect(function()
         local t = tween(panel, 0.3, { Size = SIZE_ZERO })
         t.Completed:Wait()
-        guideGui:Destroy()
-        guideOpen = false
+        if guideGui then
+            guideGui:Destroy()
+            guideGui = nil
+        end
     end)
 
-    tween(panel, 0.4, { Size = UDim2.new(0, 450, 0, 400) }, Enum.EasingStyle.Back)
+    tween(panel, 0.4, { Size = UDim2.new(0, width, 0, height) }, Enum.EasingStyle.Back)
 end)
 
 ----------------------------------------------------------------
 -- Tombol close & hover
 ----------------------------------------------------------------
--- Dulu: tombol close menyembunyikan GUI sehingga tidak bisa dibuka lagi.
--- Sekarang: animasi tutup lalu hancurkan GUI.
+local closing = false
+
 closeButton.MouseButton1Click:Connect(function()
+    if closing then return end
+    closing = true
     state.cancelled = true
+    state.running = false
+
     local t = tween(main, 0.25, { Size = SIZE_ZERO }, Enum.EasingStyle.Back, Enum.EasingDirection.In)
     t.Completed:Wait()
+
+    for _, c in ipairs(connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(connections)
+
+    if guideGui then
+        guideGui:Destroy()
+        guideGui = nil
+    end
     screenGui:Destroy()
 end)
 
@@ -832,7 +940,6 @@ guideButton.MouseLeave:Connect(function() guideButton.BackgroundColor3 = Color3.
 -- Inisialisasi
 ----------------------------------------------------------------
 local function defaultFileName()
-    -- Bug lama: string.format("FayintSaveMap", ...) tidak punya placeholder
     return os.date("FayintSaveMap_%d%m_%H%M")
 end
 
