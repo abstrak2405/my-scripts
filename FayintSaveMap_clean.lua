@@ -1,5 +1,5 @@
 --[[
-    SaveMap | FayintX (v3: + Stream Sweep untuk game StreamingEnabled)
+    SaveMap | FayintX (v4: Stream Sweep menunggu pemuatan selesai)
     Tambahan v2: Anonymous, NilInstances, IgnoreSpecialProperties, TreatUnionsAsParts,
     RemovePlayerCharacters, IsolateLocalPlayer, Debug log, tab Settings bisa di-scroll,
     deteksi save yang gagal diam-diam, nama file tidak menimpa file lama.
@@ -729,6 +729,29 @@ local function countWorkspace()
     return ok and n or 0
 end
 
+-- Menunggu sampai jumlah objek Workspace berhenti bertambah.
+-- minWait : jeda minimum (detik) setelah pindah titik
+-- maxWait : batas waktu tunggu per titik (detik)
+-- quiet   : berapa kali cek berturut-turut tanpa perubahan agar dianggap selesai
+local function waitForStream(minWait, maxWait, quiet)
+    local t0 = os.clock()
+    task.wait(minWait)
+    local last = countWorkspace()
+    local stable = 0
+    while os.clock() - t0 < maxWait and not state.cancelled do
+        task.wait(0.3)
+        local now = countWorkspace()
+        if now == last then
+            stable = stable + 1
+            if stable >= quiet then break end
+        else
+            stable = 0
+            last = now
+        end
+    end
+    return last
+end
+
 local function loadStreamedMap()
     if not Workspace.StreamingEnabled then
         return true, "StreamingEnabled mati, sweep tidak perlu"
@@ -741,13 +764,19 @@ local function loadStreamedMap()
         return false, "Karakter belum siap (HumanoidRootPart tidak ada)"
     end
 
-    -- jarak antar titik = sebagian dari radius streaming
-    local step = 400
-    pcall(function() step = math.max(128, Workspace.StreamingTargetRadius * 0.6) end)
+    ------------------------------------------------------------
+    -- Pengaturan (naikkan kalau masih ada bagian yang belum render)
+    ------------------------------------------------------------
+    local STEP_FACTOR = 0.4   -- jarak antar titik = radius streaming * nilai ini (lebih kecil = tumpang tindih lebih rapat)
+    local MAX_RING    = 12    -- sejauh berapa ring dari posisi awal
+    local STALL_LIMIT = 2     -- berhenti kalau N ring berturut-turut tidak menambah objek
+    local MIN_WAIT    = 1.5   -- jeda minimum di tiap titik (detik)
+    local MAX_WAIT    = 8     -- batas tunggu di tiap titik (detik)
+    local QUIET       = 3     -- butuh N kali cek (x0,3 dtk) tanpa penambahan objek
+    local SETTLE_END  = 4     -- tunggu ekstra di akhir sebelum menyimpan (detik)
 
-    local MAX_RING = 12      -- batas jarak sweep (MAX_RING * step stud dari posisi awal)
-    local STALL_LIMIT = 2    -- berhenti kalau 2 ring berturut-turut tidak menambah objek
-    local WAIT = 0.4         -- jeda tiap titik agar server sempat mengirim data
+    local step = 300
+    pcall(function() step = math.max(96, Workspace.StreamingTargetRadius * STEP_FACTOR) end)
 
     -- usahakan objek yang sudah dimuat tidak di-stream out lagi
     pcall(function()
@@ -762,41 +791,53 @@ local function loadStreamedMap()
     local last = countWorkspace()
     local ringsDone = 0
 
-    local function visit(dx, dz)
-        hrp.CFrame = CFrame.new(home.X + dx, home.Y, home.Z + dz)
-        task.wait(WAIT)
+    local function visit(dx, dz, label)
+        if state.cancelled then return end
+        local pos = Vector3.new(home.X + dx, home.Y, home.Z + dz)
+        hrp.CFrame = CFrame.new(pos)
+
+        -- bantu minta server stream di sekitar titik ini (kalau didukung; dibungkus pcall)
+        task.spawn(function()
+            pcall(function() lp:RequestStreamAroundAsync(pos, MAX_WAIT) end)
+        end)
+
+        last = waitForStream(MIN_WAIT, MAX_WAIT, QUIET)
+        setProgress(12, "Streaming", string.format("%s (%d objek)", label, last))
     end
 
     for ring = 1, MAX_RING do
         if state.cancelled then break end
-        setProgress(12, "Streaming",
-            string.format("Sweep ring %d/%d (%d objek)", ring, MAX_RING, last))
 
         local d = ring * step
-        -- keliling persegi pada jarak d dari titik awal
+        local points = {}
         for t = -ring, ring do
-            if state.cancelled then break end
-            visit(t * step,  d)
-            visit(t * step, -d)
+            table.insert(points, { t * step,  d })
+            table.insert(points, { t * step, -d })
             if t ~= -ring and t ~= ring then
-                visit( d, t * step)
-                visit(-d, t * step)
+                table.insert(points, {  d, t * step })
+                table.insert(points, { -d, t * step })
             end
         end
 
+        local before = last
+        for n, pt in ipairs(points) do
+            if state.cancelled then break end
+            visit(pt[1], pt[2],
+                string.format("Ring %d/%d titik %d/%d", ring, MAX_RING, n, #points))
+        end
+
         ringsDone = ring
-        local now = countWorkspace()
-        if now <= last * 1.005 then
+        if last <= before * 1.005 then
             stalls = stalls + 1
         else
             stalls = 0
         end
-        last = now
         if stalls >= STALL_LIMIT then break end
     end
 
+    -- kembali ke posisi awal dan beri waktu tambahan agar semuanya selesai dimuat
     hrp.CFrame = home
-    task.wait(WAIT)
+    waitForStream(SETTLE_END, SETTLE_END + 6, QUIET)
     hrp.Anchored = wasAnchored
 
     return true, string.format("Sweep selesai (%d ring, %d objek di Workspace)", ringsDone, last)
