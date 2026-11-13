@@ -1,5 +1,8 @@
 --[[
-    SaveMap | FayintX (versi diperbaiki)
+    SaveMap | FayintX (v3: + Stream Sweep untuk game StreamingEnabled)
+    Tambahan v2: Anonymous, NilInstances, IgnoreSpecialProperties, TreatUnionsAsParts,
+    RemovePlayerCharacters, IsolateLocalPlayer, Debug log, tab Settings bisa di-scroll,
+    deteksi save yang gagal diam-diam, nama file tidak menimpa file lama.
     Perbaikan utama:
     - Hapus goto/label (tidak didukung Luau -> penyebab GUI tidak muncul)
     - Parent GUI aman: gethui -> CoreGui -> PlayerGui + protect_gui
@@ -359,9 +362,12 @@ new("UIPadding", {
 local savePage = new("Frame", {
     Name = "SavePage", BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, 0),
 }, content)
-local settingsPage = new("Frame", {
-    Name = "SettingsPage", BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, 0), Visible = false,
+local settingsPage = new("ScrollingFrame", {
+    Name = "SettingsPage", BackgroundTransparency = 1, BorderSizePixel = 0,
+    Size = UDim2.new(1, 0, 1, 0), Visible = false,
+    ScrollBarThickness = 3, CanvasSize = UDim2.new(0, 0, 0, 0),
 }, content)
+new("UIPadding", { PaddingRight = UDim.new(0, 8) }, settingsPage)
 
 ----------------------------------------------------------------
 -- Halaman SAVE
@@ -536,14 +542,30 @@ local function makeToggle(label, y, default)
     return toggle
 end
 
-local settings = {
-    noscripts               = makeToggle("Disable Decompile", 0, false),
-    scriptcache             = makeToggle("Use Cache", 40, true),
-    SaveBytecode            = makeToggle("Save Bytecode", 80, false),
-    IgnoreDefaultProperties = makeToggle("Ignore Default Props", 120, true),
-    SafeMode                = makeToggle("Safe Mode", 160, false),
-    SaveTerrain             = makeToggle("Save Terrain", 200, true),
+-- key = nama di tabel settings, opt = nama opsi di modul (default = key)
+-- onlyIfTrue = opsi hanya dikirim kalau dinyalakan (agar default modul per-executor tetap berlaku)
+local TOGGLES = {
+    { key = "noscripts",               label = "Disable Decompile",   default = false },
+    { key = "scriptcache",             label = "Use Cache",           default = true },
+    { key = "SaveBytecode",            label = "Save Bytecode",       default = false },
+    { key = "IgnoreDefaultProperties", label = "Ignore Default Props", default = true },
+    { key = "SafeMode",                label = "Safe Mode (kick)",    default = false },
+    { key = "Anonymous",               label = "Anonymous (hide name)", default = false },
+    { key = "NilInstances",            label = "Save Nil Instances",  default = false },
+    { key = "RemovePlayerCharacters",  label = "Remove Player Chars", default = true },
+    { key = "IsolateLocalPlayer",      label = "Isolate LocalPlayer", default = false },
+    { key = "IgnoreSpecialProperties", label = "Ignore Special Props", default = false, onlyIfTrue = true },
+    { key = "TreatUnionsAsParts",      label = "Unions as Parts",     default = false, onlyIfTrue = true },
+    { key = "DebugMode",               label = "Debug Log (F9)",      default = false, opt = "__DEBUG_MODE" },
+    -- guiOnly = dipakai script ini saja, tidak dikirim ke modul
+    { key = "StreamSweep",             label = "Load Streamed Map (sweep)", default = false, guiOnly = true },
 }
+
+local settings = {}
+for index, def in ipairs(TOGGLES) do
+    settings[def.key] = makeToggle(def.label, (index - 1) * 40, def.default)
+end
+settingsPage.CanvasSize = UDim2.new(0, 0, 0, #TOGGLES * 40 + 10)
 
 ----------------------------------------------------------------
 -- Tab switching
@@ -569,6 +591,7 @@ local state = {
     busy = false,      -- modul save masih berjalan di belakang layar
     cancelled = false,
     done = false,
+    callbackFired = false,
     runId = 0,
     total = 0,
     processed = 0,
@@ -650,14 +673,8 @@ local function loadSaveModule()
 end
 
 local function buildOptions(fileName, runId, onFinished)
-    return {
+    local opts = {
         mode = mode,
-        noscripts = settings.noscripts.state,
-        scriptcache = settings.scriptcache.state,
-        SaveBytecode = settings.SaveBytecode.state,
-        IgnoreDefaultProperties = settings.IgnoreDefaultProperties.state,
-        SafeMode = settings.SafeMode.state,
-        SaveTerrain = settings.SaveTerrain.state,
         ShowStatus = false,
         FilePath = fileName,
         __DEBUG_MODE = false,
@@ -668,16 +685,21 @@ local function buildOptions(fileName, runId, onFinished)
         AntiIdle = true,
         Callback = function(data, _, size)
             onFinished()
+            state.callbackFired = true
             if state.cancelled or state.runId ~= runId then return end
 
             setProgress(95, "Writing", "Finalizing file write...")
 
             -- Tulis manual hanya jika modul belum membuat file sendiri
             if writefile then
-                local path = fileName:match("%.rbxlx?$") and fileName or (fileName .. ".rbxlx")
-                local exists = isfile and isfile(path)
-                if not exists and data then
-                    pcall(writefile, path, data)
+                local base = fileName:gsub("%.rbxlx?$", "")
+                local path = base .. ".rbxlx"
+                if isfile and isfile(path) then
+                    path = base .. "_" .. os.date("%H%M%S") .. ".rbxlx"
+                end
+                local okWrite, errWrite = pcall(writefile, path, data)
+                if not okWrite then
+                    warn("[SaveMap] writefile gagal:", errWrite)
                 end
             end
 
@@ -686,6 +708,98 @@ local function buildOptions(fileName, runId, onFinished)
                 string.format("File saved successfully (%.2f MB)", bytes / 1048576))
         end,
     }
+
+    -- Opsi dari toggle di tab Settings
+    for _, def in ipairs(TOGGLES) do
+        local value = settings[def.key].state
+        if not def.guiOnly and (value or not def.onlyIfTrue) then
+            opts[def.opt or def.key] = value
+        end
+    end
+
+    return opts
+end
+
+----------------------------------------------------------------
+-- Stream Sweep: memuat bagian map yang belum di-stream
+-- (hanya berguna kalau Workspace.StreamingEnabled = true)
+----------------------------------------------------------------
+local function countWorkspace()
+    local ok, n = pcall(function() return #Workspace:GetDescendants() end)
+    return ok and n or 0
+end
+
+local function loadStreamedMap()
+    if not Workspace.StreamingEnabled then
+        return true, "StreamingEnabled mati, sweep tidak perlu"
+    end
+
+    local lp = Players.LocalPlayer
+    local char = lp and lp.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        return false, "Karakter belum siap (HumanoidRootPart tidak ada)"
+    end
+
+    -- jarak antar titik = sebagian dari radius streaming
+    local step = 400
+    pcall(function() step = math.max(128, Workspace.StreamingTargetRadius * 0.6) end)
+
+    local MAX_RING = 12      -- batas jarak sweep (MAX_RING * step stud dari posisi awal)
+    local STALL_LIMIT = 2    -- berhenti kalau 2 ring berturut-turut tidak menambah objek
+    local WAIT = 0.4         -- jeda tiap titik agar server sempat mengirim data
+
+    -- usahakan objek yang sudah dimuat tidak di-stream out lagi
+    pcall(function()
+        sethiddenproperty(Workspace, "StreamOutBehavior", Enum.StreamOutBehavior.LowMemory)
+    end)
+
+    local home = hrp.CFrame
+    local wasAnchored = hrp.Anchored
+    hrp.Anchored = true
+
+    local stalls = 0
+    local last = countWorkspace()
+    local ringsDone = 0
+
+    local function visit(dx, dz)
+        hrp.CFrame = CFrame.new(home.X + dx, home.Y, home.Z + dz)
+        task.wait(WAIT)
+    end
+
+    for ring = 1, MAX_RING do
+        if state.cancelled then break end
+        setProgress(12, "Streaming",
+            string.format("Sweep ring %d/%d (%d objek)", ring, MAX_RING, last))
+
+        local d = ring * step
+        -- keliling persegi pada jarak d dari titik awal
+        for t = -ring, ring do
+            if state.cancelled then break end
+            visit(t * step,  d)
+            visit(t * step, -d)
+            if t ~= -ring and t ~= ring then
+                visit( d, t * step)
+                visit(-d, t * step)
+            end
+        end
+
+        ringsDone = ring
+        local now = countWorkspace()
+        if now <= last * 1.005 then
+            stalls = stalls + 1
+        else
+            stalls = 0
+        end
+        last = now
+        if stalls >= STALL_LIMIT then break end
+    end
+
+    hrp.CFrame = home
+    task.wait(WAIT)
+    hrp.Anchored = wasAnchored
+
+    return true, string.format("Sweep selesai (%d ring, %d objek di Workspace)", ringsDone, last)
 end
 
 local function startSave()
@@ -699,6 +813,7 @@ local function startSave()
     state.busy = true
     state.cancelled = false
     state.done = false
+    state.callbackFired = false
     state.runId = state.runId + 1
     state.processed = 0
     state.total = 0
@@ -728,6 +843,15 @@ local function startSave()
             local saveMap = loadSaveModule()
             if state.cancelled then return end
 
+            if settings.StreamSweep.state then
+                local okSweep, msg = loadStreamedMap()
+                detailLabel.Text = tostring(msg)
+                if not okSweep then
+                    notify("Stream Sweep", tostring(msg))
+                end
+                if state.cancelled then return end
+            end
+
             setProgress(15, "Configuring", "Building save options...")
             local finished = false
             local options = buildOptions(fileName, runId, function() finished = true end)
@@ -753,6 +877,10 @@ local function startSave()
             finished = true
 
             if state.cancelled or state.runId ~= runId then return end
+
+            if not state.callbackFired then
+                error("Modul tidak menghasilkan data (mungkin save sebelumnya masih tercatat berjalan). Rejoin lalu coba lagi.")
+            end
 
             state.done = true
             cancelButton.Visible = false
