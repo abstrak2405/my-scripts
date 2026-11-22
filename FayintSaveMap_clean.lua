@@ -31,7 +31,7 @@ local Workspace         = game:GetService("Workspace")
 local GUI_NAME = "FayintXCopy"
 local GUIDE_NAME = "SaveMapGuide"
 local SAVE_MODULE_URL =
-    "https://raw.githubusercontent.com/FayintXhub/FayintLibrary/refs/heads/main/FYSavemap.luau"
+    "https://raw.githubusercontent.com/rbxlx/UniversalSynSaveInstance/main/saveinstance.luau"
 
 local SIZE_OPEN = UDim2.new(0.36, 0, 0.42, 0)
 local SIZE_ZERO = UDim2.new(0, 0, 0, 0)
