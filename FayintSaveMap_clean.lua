@@ -1,16 +1,16 @@
 --[[
-    SaveMap | FayintX (v4: Stream Sweep menunggu pemuatan selesai)
-    Tambahan v2: Anonymous, NilInstances, IgnoreSpecialProperties, TreatUnionsAsParts,
-    RemovePlayerCharacters, IsolateLocalPlayer, Debug log, tab Settings bisa di-scroll,
-    deteksi save yang gagal diam-diam, nama file tidak menimpa file lama.
-    Perbaikan utama:
-    - Hapus goto/label (tidak didukung Luau -> penyebab GUI tidak muncul)
-    - Parent GUI aman: gethui -> CoreGui -> PlayerGui + protect_gui
-    - HttpGet/loadstring dibungkus pcall, ada fallback request/http_request
-    - Cancel tidak lagi bisa diklik setelah selesai & tidak bisa Start ganda
-    - Koneksi drag dilepas saat GUI ditutup
-    - Panel guide responsif (scroll) dan ikut hancur saat GUI ditutup
-    - Guard error di seluruh bagian pembuatan GUI
+    SaveMap | FayintX (v5)
+    Perubahan v5:
+    - Save Terrain: toggle + pengecekan terrain (sebelum save) + status gethiddenproperty (setelah save)
+    - Modul menulis file sendiri (tanpa Callback): biner .rbxl terkompresi atau XML .rbxlx (toggle Binary)
+      -> perbaikan bug lama: data biner sebelumnya ditulis ke file .rbxlx
+    - IgnoreSpecialProperties otomatis dimatikan saat Save Terrain aktif (kalau tidak, terrain hilang)
+    - Stream Sweep: dibungkus pcall (anchor selalu dipulihkan), hitung objek via DescendantAdded
+      (tidak lagi GetDescendants tiap 0,3 dtk), tidak menunggu settle saat dibatalkan
+    - Nama file unik (.rbxl / .rbxlx), titik pada nama diganti agar modul menambah ekstensi sendiri
+    - Deteksi gagal: path hasil dari modul dicek dengan isfile
+    - Reset USSI.Running setelah error, setProgress aman setelah GUI ditutup, label toggle dipotong rapi
+    - Peringatan: SCRIPTS + Disable Decompile, terrain di mode SCRIPTS
 ]]
 
 ----------------------------------------------------------------
@@ -24,14 +24,18 @@ local TweenService      = game:GetService("TweenService")
 local Lighting          = game:GetService("Lighting")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace         = game:GetService("Workspace")
+local HttpService       = game:GetService("HttpService")
 
 ----------------------------------------------------------------
 -- Konfigurasi
 ----------------------------------------------------------------
 local GUI_NAME = "FayintXCopy"
 local GUIDE_NAME = "SaveMapGuide"
+-- Disarankan: ganti "main" dengan commit hash tertentu agar isi modul tidak berubah diam-diam.
+-- Catatan: modul ini juga memuat dependensi dari rbxlx/SomeHub/main.
 local SAVE_MODULE_URL =
     "https://raw.githubusercontent.com/rbxlx/UniversalSynSaveInstance/main/saveinstance.luau"
+local EXEC_STATE_FILE = "ussi_cache/EXEC_STATE.json"
 
 local SIZE_OPEN = UDim2.new(0.36, 0, 0.42, 0)
 local SIZE_ZERO = UDim2.new(0, 0, 0, 0)
@@ -51,7 +55,7 @@ local C = {
 }
 
 ----------------------------------------------------------------
--- Deteksi executor + warna aksen (tanpa goto)
+-- Deteksi executor + warna aksen
 ----------------------------------------------------------------
 local function detectExecutor()
     local ok, name = pcall(function()
@@ -193,7 +197,9 @@ local function getGuiParent()
     end
     local ok = pcall(function() return CoreGui.Name end)
     if ok then return CoreGui end
-    local lp = Players.LocalPlayer or Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+    if not Players.LocalPlayer then
+        Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+    end
     return Players.LocalPlayer:WaitForChild("PlayerGui")
 end
 
@@ -469,12 +475,14 @@ local statusLabel = new("TextLabel", {
     BackgroundTransparency = 1, Position = UDim2.new(0, 0, 0.38, 0), Size = UDim2.new(1, 0, 0.06, 0),
     Font = Enum.Font.Gotham, Text = "Status: Idle", TextColor3 = Color3.fromRGB(180, 180, 180),
     TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
 }, savePage)
 
 local detailLabel = new("TextLabel", {
     BackgroundTransparency = 1, Position = UDim2.new(0, 0, 0.45, 0), Size = UDim2.new(1, 0, 0.06, 0),
     Font = Enum.Font.Gotham, Text = "Instances: 0 / 0", TextColor3 = Color3.fromRGB(150, 150, 150),
     TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
 }, savePage)
 
 -- Tombol aksi
@@ -516,9 +524,10 @@ local function makeToggle(label, y, default)
     }, settingsPage)
 
     new("TextLabel", {
-        BackgroundTransparency = 1, Size = UDim2.new(0.7, 0, 1, 0),
+        BackgroundTransparency = 1, Size = UDim2.new(1, -50, 1, 0),
         Font = Enum.Font.Gotham, Text = label, TextColor3 = C.textLabel,
-        TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left,
+        TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
     }, row)
 
     local track = new("TextButton", {
@@ -543,21 +552,23 @@ local function makeToggle(label, y, default)
 end
 
 -- key = nama di tabel settings, opt = nama opsi di modul (default = key)
--- onlyIfTrue = opsi hanya dikirim kalau dinyalakan (agar default modul per-executor tetap berlaku)
+-- onlyIfTrue = opsi hanya dikirim kalau dinyalakan (agar default modul tetap berlaku)
+-- guiOnly    = dipakai skrip ini saja, tidak dikirim ke modul
 local TOGGLES = {
-    { key = "noscripts",               label = "Disable Decompile",   default = false },
-    { key = "scriptcache",             label = "Use Cache",           default = true },
-    { key = "SaveBytecode",            label = "Save Bytecode",       default = false },
-    { key = "IgnoreDefaultProperties", label = "Ignore Default Props", default = true },
-    { key = "SafeMode",                label = "Safe Mode (kick)",    default = false },
+    { key = "SaveTerrain",             label = "Save Terrain",          default = true,  guiOnly = true },
+    { key = "Binary",                  label = "Binary .rbxl (kecil)",  default = true },
+    { key = "noscripts",               label = "Disable Decompile",     default = false },
+    { key = "scriptcache",             label = "Use Cache",             default = true },
+    { key = "SaveBytecode",            label = "Save Bytecode",         default = false },
+    { key = "IgnoreDefaultProperties", label = "Ignore Default Props",  default = true },
+    { key = "SafeMode",                label = "Safe Mode (kick)",      default = false },
     { key = "Anonymous",               label = "Anonymous (hide name)", default = false },
-    { key = "NilInstances",            label = "Save Nil Instances",  default = false },
-    { key = "RemovePlayerCharacters",  label = "Remove Player Chars", default = true },
-    { key = "IsolateLocalPlayer",      label = "Isolate LocalPlayer", default = false },
-    { key = "IgnoreSpecialProperties", label = "Ignore Special Props", default = false, onlyIfTrue = true },
-    { key = "TreatUnionsAsParts",      label = "Unions as Parts",     default = false, onlyIfTrue = true },
-    { key = "DebugMode",               label = "Debug Log (F9)",      default = false, opt = "__DEBUG_MODE" },
-    -- guiOnly = dipakai script ini saja, tidak dikirim ke modul
+    { key = "NilInstances",            label = "Save Nil Instances",    default = false },
+    { key = "RemovePlayerCharacters",  label = "Remove Player Chars",   default = true },
+    { key = "IsolateLocalPlayer",      label = "Isolate LocalPlayer",   default = false },
+    { key = "IgnoreSpecialProperties", label = "Ignore Special Props",  default = false, onlyIfTrue = true },
+    { key = "TreatUnionsAsParts",      label = "Unions as Parts",       default = false, onlyIfTrue = true },
+    { key = "DebugMode",               label = "Debug Log (F9)",        default = false, opt = "__DEBUG_MODE" },
     { key = "StreamSweep",             label = "Load Streamed Map (sweep)", default = false, guiOnly = true },
 }
 
@@ -591,15 +602,15 @@ local state = {
     busy = false,      -- modul save masih berjalan di belakang layar
     cancelled = false,
     done = false,
-    callbackFired = false,
     runId = 0,
     total = 0,
     processed = 0,
     startTime = 0,
+    terrainExpected = false,
 }
 
 local function setProgress(percent, phase, detail)
-    if not progressContainer.Parent then return end
+    if not screenGui.Parent then return end
 
     percent = math.floor(math.clamp(percent, 0, 100))
     local countText = state.total > 0
@@ -632,7 +643,7 @@ local function resetButtons()
 end
 
 ----------------------------------------------------------------
--- Logika save
+-- Util save
 ----------------------------------------------------------------
 local function countInstances()
     local total = 0
@@ -672,41 +683,70 @@ local function loadSaveModule()
     return fn()
 end
 
-local function buildOptions(fileName, runId, onFinished)
+-- Status pembacaan properti tersembunyi yang dicatat modul di ussi_cache.
+-- Mengembalikan "ok" | "failed" | "crashed" | nil (belum pernah dites)
+local function ghpStatus(key)
+    if not (readfile and isfile and isfile(EXEC_STATE_FILE)) then return nil end
+    local ok, decoded = pcall(function()
+        return HttpService:JSONDecode(readfile(EXEC_STATE_FILE))
+    end)
+    if not ok or type(decoded) ~= "table" then return nil end
+    local _, st = next(decoded)
+    return type(st) == "table" and type(st.ghp) == "table" and st.ghp[key] or nil
+end
+
+-- Cek sebelum save (setelah sweep): apakah terrain ada dan peluangnya tersimpan
+local function terrainPreflight()
+    local terrain = Workspace:FindFirstChildOfClass("Terrain")
+    if not terrain then
+        return false, "Map tidak punya Terrain"
+    end
+    if mode == "scripts" then
+        return false, "Mode SCRIPTS tidak menyimpan terrain"
+    end
+
+    local bs, bool = ghpStatus("BinaryString"), ghpStatus("boolean")
+    if bs == "crashed" or bs == "failed" or bool == "crashed" or bool == "failed" then
+        return false, "Executor gagal baca properti tersembunyi. Hapus ussi_cache/EXEC_STATE.json lalu coba lagi"
+    end
+
+    local okExt, e = pcall(function() return terrain.MaxExtents end)
+    if okExt and e then
+        local filled = e.Max.X > e.Min.X and e.Max.Y > e.Min.Y and e.Max.Z > e.Min.Z
+        if not filled then
+            return false, "Terrain kosong (belum ter-stream?)"
+        end
+    end
+    return true, "Terrain terdeteksi"
+end
+
+-- Cek sesudah save: modul berhasil membaca properti tersembunyi (SmoothGrid bertipe BinaryString)
+local function terrainReadable()
+    return ghpStatus("BinaryString") == "ok" and ghpStatus("boolean") == "ok"
+end
+
+-- Nama dasar tanpa ekstensi yang belum dipakai. Titik diganti agar modul menambah ekstensi sendiri
+local function uniqueBase(name)
+    name = name:gsub('[\\/:*?"<>|%.]', "_")
+    if name == "" then name = "FayintSavedMap" end
+    local base, n = name, 0
+    while isfile and (isfile(base .. ".rbxl") or isfile(base .. ".rbxlx")) do
+        n = n + 1
+        base = string.format("%s_%d", name, n)
+    end
+    return base
+end
+
+local function buildOptions(fileBase)
     local opts = {
         mode = mode,
         ShowStatus = false,
-        FilePath = fileName,
+        FilePath = fileBase, -- tanpa ekstensi, modul menambahkan .rbxl / .rbxlx
         __DEBUG_MODE = false,
-        timeout = 15,
-        AvoidFileOverwrite = true,
+        timeout = 15,        -- alias DecompileTimeout
         AlternativeWritefile = true,
         ReadMe = true,
         AntiIdle = true,
-        Callback = function(data, _, size)
-            onFinished()
-            state.callbackFired = true
-            if state.cancelled or state.runId ~= runId then return end
-
-            setProgress(95, "Writing", "Finalizing file write...")
-
-            -- Tulis manual hanya jika modul belum membuat file sendiri
-            if writefile then
-                local base = fileName:gsub("%.rbxlx?$", "")
-                local path = base .. ".rbxlx"
-                if isfile and isfile(path) then
-                    path = base .. "_" .. os.date("%H%M%S") .. ".rbxlx"
-                end
-                local okWrite, errWrite = pcall(writefile, path, data)
-                if not okWrite then
-                    warn("[SaveMap] writefile gagal:", errWrite)
-                end
-            end
-
-            local bytes = (type(size) == "number" and size) or #tostring(data)
-            setProgress(100, "Completed",
-                string.format("File saved successfully (%.2f MB)", bytes / 1048576))
-        end,
     }
 
     -- Opsi dari toggle di tab Settings
@@ -717,6 +757,14 @@ local function buildOptions(fileName, runId, onFinished)
         end
     end
 
+    if settings.SaveTerrain.state then
+        -- tanpa gethiddenproperty, SmoothGrid tidak terbaca dan terrain hilang
+        opts.IgnoreSpecialProperties = false
+    else
+        -- IgnoreList menggantikan default modul, jadi default ditulis ulang
+        opts.IgnoreList = { "CoreGui", "CorePackages", "Terrain", Packages = false }
+    end
+
     return opts
 end
 
@@ -724,34 +772,6 @@ end
 -- Stream Sweep: memuat bagian map yang belum di-stream
 -- (hanya berguna kalau Workspace.StreamingEnabled = true)
 ----------------------------------------------------------------
-local function countWorkspace()
-    local ok, n = pcall(function() return #Workspace:GetDescendants() end)
-    return ok and n or 0
-end
-
--- Menunggu sampai jumlah objek Workspace berhenti bertambah.
--- minWait : jeda minimum (detik) setelah pindah titik
--- maxWait : batas waktu tunggu per titik (detik)
--- quiet   : berapa kali cek berturut-turut tanpa perubahan agar dianggap selesai
-local function waitForStream(minWait, maxWait, quiet)
-    local t0 = os.clock()
-    task.wait(minWait)
-    local last = countWorkspace()
-    local stable = 0
-    while os.clock() - t0 < maxWait and not state.cancelled do
-        task.wait(0.3)
-        local now = countWorkspace()
-        if now == last then
-            stable = stable + 1
-            if stable >= quiet then break end
-        else
-            stable = 0
-            last = now
-        end
-    end
-    return last
-end
-
 local function loadStreamedMap()
     if not Workspace.StreamingEnabled then
         return true, "StreamingEnabled mati, sweep tidak perlu"
@@ -767,9 +787,10 @@ local function loadStreamedMap()
     ------------------------------------------------------------
     -- Pengaturan (naikkan kalau masih ada bagian yang belum render)
     ------------------------------------------------------------
-    local STEP_FACTOR = 0.4   -- jarak antar titik = radius streaming * nilai ini (lebih kecil = tumpang tindih lebih rapat)
+    local STEP_FACTOR = 0.4   -- jarak antar titik = radius streaming * nilai ini
     local MAX_RING    = 12    -- sejauh berapa ring dari posisi awal
-    local STALL_LIMIT = 2     -- berhenti kalau N ring berturut-turut tidak menambah objek
+    local STALL_LIMIT = 3     -- berhenti kalau N ring berturut-turut hampir tidak menambah objek
+    local MIN_GAIN    = 30    -- tambahan objek minimum per ring agar dianggap "masih ada yang baru"
     local MIN_WAIT    = 1.5   -- jeda minimum di tiap titik (detik)
     local MAX_WAIT    = 8     -- batas tunggu di tiap titik (detik)
     local QUIET       = 3     -- butuh N kali cek (x0,3 dtk) tanpa penambahan objek
@@ -783,66 +804,98 @@ local function loadStreamedMap()
         sethiddenproperty(Workspace, "StreamOutBehavior", Enum.StreamOutBehavior.LowMemory)
     end)
 
+    -- hitung objek baru lewat event (jauh lebih ringan daripada GetDescendants berulang)
+    local added = 0
+    local addConn = Workspace.DescendantAdded:Connect(function()
+        added = added + 1
+    end)
+
+    local function waitForStream(minWait, maxWait, quiet)
+        local t0 = os.clock()
+        task.wait(minWait)
+        local lastAdded, stable = added, 0
+        while os.clock() - t0 < maxWait and not state.cancelled do
+            task.wait(0.3)
+            if added == lastAdded then
+                stable = stable + 1
+                if stable >= quiet then break end
+            else
+                stable, lastAdded = 0, added
+            end
+        end
+    end
+
     local home = hrp.CFrame
     local wasAnchored = hrp.Anchored
-    hrp.Anchored = true
-
-    local stalls = 0
-    local last = countWorkspace()
-    local ringsDone = 0
+    local ringsDone, stalls = 0, 0
 
     local function visit(dx, dz, label)
         if state.cancelled then return end
+        if not hrp.Parent then error("karakter hilang saat sweep") end
+
         local pos = Vector3.new(home.X + dx, home.Y, home.Z + dz)
         hrp.CFrame = CFrame.new(pos)
 
-        -- bantu minta server stream di sekitar titik ini (kalau didukung; dibungkus pcall)
+        -- bantu minta server stream di sekitar titik ini (kalau didukung)
         task.spawn(function()
             pcall(function() lp:RequestStreamAroundAsync(pos, MAX_WAIT) end)
         end)
 
-        last = waitForStream(MIN_WAIT, MAX_WAIT, QUIET)
-        setProgress(12, "Streaming", string.format("%s (%d objek)", label, last))
+        waitForStream(MIN_WAIT, MAX_WAIT, QUIET)
+        setProgress(12, "Streaming", string.format("%s (+%d objek)", label, added))
     end
 
-    for ring = 1, MAX_RING do
-        if state.cancelled then break end
+    hrp.Anchored = true
 
-        local d = ring * step
-        local points = {}
-        for t = -ring, ring do
-            table.insert(points, { t * step,  d })
-            table.insert(points, { t * step, -d })
-            if t ~= -ring and t ~= ring then
-                table.insert(points, {  d, t * step })
-                table.insert(points, { -d, t * step })
-            end
-        end
-
-        local before = last
-        for n, pt in ipairs(points) do
+    local okRun, errRun = pcall(function()
+        for ring = 1, MAX_RING do
             if state.cancelled then break end
-            visit(pt[1], pt[2],
-                string.format("Ring %d/%d titik %d/%d", ring, MAX_RING, n, #points))
-        end
 
-        ringsDone = ring
-        if last <= before * 1.005 then
-            stalls = stalls + 1
-        else
-            stalls = 0
+            local d = ring * step
+            local points = {}
+            for t = -ring, ring do
+                table.insert(points, { t * step,  d })
+                table.insert(points, { t * step, -d })
+                if t ~= -ring and t ~= ring then
+                    table.insert(points, {  d, t * step })
+                    table.insert(points, { -d, t * step })
+                end
+            end
+
+            local before = added
+            for n, pt in ipairs(points) do
+                if state.cancelled then break end
+                visit(pt[1], pt[2],
+                    string.format("Ring %d/%d titik %d/%d", ring, MAX_RING, n, #points))
+            end
+
+            ringsDone = ring
+            if added - before < MIN_GAIN then
+                stalls = stalls + 1
+            else
+                stalls = 0
+            end
+            if stalls >= STALL_LIMIT then break end
         end
-        if stalls >= STALL_LIMIT then break end
+    end)
+
+    -- pulihkan posisi & anchor APAPUN yang terjadi di atas
+    pcall(function() hrp.CFrame = home end)
+    if okRun and not state.cancelled then
+        waitForStream(SETTLE_END, SETTLE_END + 6, QUIET)
     end
+    pcall(function() hrp.Anchored = wasAnchored end)
+    addConn:Disconnect()
 
-    -- kembali ke posisi awal dan beri waktu tambahan agar semuanya selesai dimuat
-    hrp.CFrame = home
-    waitForStream(SETTLE_END, SETTLE_END + 6, QUIET)
-    hrp.Anchored = wasAnchored
-
-    return true, string.format("Sweep selesai (%d ring, %d objek di Workspace)", ringsDone, last)
+    if not okRun then
+        return false, "Sweep gagal: " .. tostring(errRun)
+    end
+    return true, string.format("Sweep selesai (%d ring, +%d objek)", ringsDone, added)
 end
 
+----------------------------------------------------------------
+-- Logika save
+----------------------------------------------------------------
 local function startSave()
     if state.running then return end
     if state.busy then
@@ -854,11 +907,11 @@ local function startSave()
     state.busy = true
     state.cancelled = false
     state.done = false
-    state.callbackFired = false
     state.runId = state.runId + 1
     state.processed = 0
     state.total = 0
     state.startTime = os.clock()
+    state.terrainExpected = false
     local runId = state.runId
 
     startButton.Text = "⏳ SAVING..."
@@ -866,14 +919,21 @@ local function startSave()
     cancelButton.Visible = true
     guideButton.Visible = false
 
-    local fileName = filenameBox.Text ~= "" and filenameBox.Text or "FayintSavedMap"
-    fileName = fileName:gsub('[\\/:*?"<>|]', "_") -- buang karakter ilegal nama file
+    local fileBase = uniqueBase(filenameBox.Text ~= "" and filenameBox.Text or "FayintSavedMap")
 
     task.spawn(function()
         local ok, err = pcall(function()
             setProgress(0, "Initializing", "Preparing save system...")
             task.wait(0.2)
             if state.cancelled then return end
+
+            -- peringatan konflik setting
+            if mode == "scripts" and settings.noscripts.state then
+                notify("Warning", "Mode SCRIPTS + Disable Decompile: isi script akan kosong")
+            end
+            if settings.IgnoreSpecialProperties.state and settings.SaveTerrain.state then
+                notify("Terrain", "Ignore Special Props dimatikan otomatis agar terrain tersimpan")
+            end
 
             setProgress(5, "Scanning", "Counting instances...")
             state.total = countInstances()
@@ -893,9 +953,19 @@ local function startSave()
                 if state.cancelled then return end
             end
 
+            -- cek terrain SETELAH sweep (terrain juga di-stream per chunk)
+            if settings.SaveTerrain.state then
+                local okT, msgT = terrainPreflight()
+                state.terrainExpected = okT
+                detailLabel.Text = msgT
+                if not okT then
+                    notify("Terrain", msgT)
+                end
+            end
+
             setProgress(15, "Configuring", "Building save options...")
             local finished = false
-            local options = buildOptions(fileName, runId, function() finished = true end)
+            local options = buildOptions(fileBase)
 
             -- Progress estimasi (bukan progres asli dari modul)
             task.spawn(function()
@@ -914,26 +984,41 @@ local function startSave()
                 end
             end)
 
-            saveMap(options)
+            -- modul menulis file sendiri dan mengembalikan path-nya
+            local savedPath = saveMap(options)
             finished = true
 
             if state.cancelled or state.runId ~= runId then return end
 
-            if not state.callbackFired then
-                error("Modul tidak menghasilkan data (mungkin save sebelumnya masih tercatat berjalan). Rejoin lalu coba lagi.")
+            if type(savedPath) ~= "string" or savedPath == "" then
+                error("Modul tidak mengembalikan path file")
+            end
+            if isfile and not isfile(savedPath) then
+                error("File hasil save tidak ditemukan: " .. savedPath)
             end
 
             state.done = true
             cancelButton.Visible = false
             state.processed = state.total
+
+            local terrainNote = ""
+            if settings.SaveTerrain.state then
+                if state.terrainExpected and terrainReadable() then
+                    terrainNote = " + terrain"
+                else
+                    terrainNote = " (terrain tidak terjamin, cek README di file)"
+                end
+            end
+
             setProgress(100, "Completed",
-                string.format("Saved %d instances successfully!", state.total))
+                string.format("Saved %d instances%s", state.total, terrainNote))
+            detailLabel.Text = savedPath
             startButton.Text = "✅ SAVED!"
             startButton.BackgroundColor3 = C.green
 
             notify("✅ Save Completed",
-                string.format("%s saved in %.1f seconds", fileName, os.clock() - state.startTime))
-            print(string.format("[SaveMap] File saved: %s.rbxlx", fileName))
+                string.format("%s (%.1f dtk)%s", savedPath, os.clock() - state.startTime, terrainNote))
+            print(string.format("[SaveMap] File saved: %s%s", savedPath, terrainNote))
         end)
 
         state.busy = false
@@ -945,6 +1030,15 @@ local function startSave()
             cancelButton.Visible = false
             notify("❌ Save Failed", "Check console for details (F9)", "rbxassetid://6023426919")
             warn("[SaveMap] Error:", err)
+
+            -- bebaskan kunci modul agar tidak perlu rejoin
+            pcall(function()
+                local u = getgenv().USSI
+                if u then
+                    u.Running = nil
+                    u.SavedFiles = {}
+                end
+            end)
         end
 
         if state.runId ~= runId or state.cancelled then return end
@@ -964,7 +1058,7 @@ local function cancelSave()
     state.running = false
 
     resetButtons()
-    setProgress(0, "Cancelled", "Save process was cancelled by user")
+    setProgress(0, "Cancelled", "Dibatalkan (modul bisa masih selesai di belakang layar)")
     notify("Save Cancelled", "Save process was cancelled")
 end
 
@@ -975,13 +1069,17 @@ cancelButton.MouseButton1Click:Connect(cancelSave)
 -- Panduan
 ----------------------------------------------------------------
 local GUIDE_LINES = {
-    "1. TERRAIN SUPPORT:",
-    "   • Use PAID executors for terrain copying",
-    "   • Free executors may NOT support terrain",
+    "1. TERRAIN:",
+    "   • Nyalakan Save Terrain di Settings",
+    "   • Butuh executor dengan gethiddenproperty",
+    "   • Ignore Special Props mematikan terrain",
+    "   • Mode SCRIPTS tidak menyimpan terrain",
+    "   • Map StreamingEnabled: nyalakan Load Streamed Map",
     "",
     "2. FILE LOCATION:",
     "   • Executor Folder > Workspace",
-    "   • Files saved as .rbxlx format",
+    "   • Binary ON = .rbxl, OFF = .rbxlx (XML, besar)",
+    "   • Nama file tidak menimpa file lama",
     "",
     "3. SAVE MODES:",
     "   • FULL - Save everything",
@@ -989,8 +1087,9 @@ local GUIDE_LINES = {
     "   • SCRIPTS - Scripts only",
     "",
     "4. IF ERROR:",
-    "   • Check executor compatibility",
-    "   • Try different save mode",
+    "   • Cek F9 dan README di dalam file hasil save",
+    "   • Hapus ussi_cache/EXEC_STATE.json lalu ulangi",
+    "   • Coba mode / executor lain",
 }
 
 local guideGui = nil
@@ -1120,5 +1219,5 @@ statusLabel.Text = "Status: Ready"
 tween(main, 0.5, { Size = SIZE_OPEN }, Enum.EasingStyle.Back)
 
 notify("🛠️ Universal SaveMap", string.format("Running on %s executor", executorName))
-print("[SaveMap] GUI Loaded - Executor:", executorName)
-print("[SaveMap] Note: Some executors may not support terrain saving")
+print("[SaveMap] GUI Loaded (v5) - Executor:", executorName)
+print("[SaveMap] Note: terrain butuh gethiddenproperty; Ignore Special Props mematikan terrain")
